@@ -42,6 +42,18 @@
 #define BPF_CALL	0x80	/* function call */
 #define BPF_EXIT	0x90	/* function return */
 
+#define BPF_ATOMIC	0xc0	/* atomic memory ops - op type in immediate */
+
+#define BPF_FETCH	0x01	/* not an opcode on its own, used to build others */
+
+#define BPF_XCHG	(0xe0 | BPF_FETCH)	/* atomic exchange */
+
+#define BPF_CMPXCHG	(0xf0 | BPF_FETCH)	/* atomic compare-and-write */
+
+#define BPF_F_RDONLY_PROG	(1U << 7)
+
+#define BPF_F_WRONLY_PROG	(1U << 8)
+
 /* Register numbers */
 enum {
 	BPF_REG_0 = 0,
@@ -103,6 +115,13 @@ enum bpf_cmd {
 	BPF_BTF_LOAD,
 	BPF_BTF_GET_FD_BY_ID,
 	BPF_TASK_FD_QUERY,
+	BPF_MAP_LOOKUP_AND_DELETE_ELEM,
+	BPF_MAP_FREEZE,
+	BPF_BTF_GET_NEXT_ID,
+	BPF_MAP_LOOKUP_BATCH,
+	BPF_MAP_LOOKUP_AND_DELETE_BATCH,
+	BPF_MAP_UPDATE_BATCH,
+	BPF_MAP_DELETE_BATCH,
 };
 
 enum bpf_map_type {
@@ -127,6 +146,11 @@ enum bpf_map_type {
 	BPF_MAP_TYPE_SOCKHASH,
 	BPF_MAP_TYPE_CGROUP_STORAGE,
 	BPF_MAP_TYPE_REUSEPORT_SOCKARRAY,
+	BPF_MAP_TYPE_PERCPU_CGROUP_STORAGE,
+	/* Keep upstream ABI IDs; queue/stack maps (22/23) are not backported. */
+	BPF_MAP_TYPE_SK_STORAGE = 24,
+	BPF_MAP_TYPE_DEVMAP_HASH = 25,
+	BPF_MAP_TYPE_RINGBUF = 27,
 };
 
 enum bpf_prog_type {
@@ -172,6 +196,13 @@ enum bpf_attach_type {
 	BPF_CGROUP_UDP4_SENDMSG,
 	BPF_CGROUP_UDP6_SENDMSG,
 	BPF_LIRC_MODE2,
+	BPF_FLOW_DISSECTOR = 17,
+	BPF_CGROUP_SYSCTL = 18,
+	BPF_CGROUP_UDP4_RECVMSG = 19,
+	BPF_CGROUP_UDP6_RECVMSG = 20,
+	BPF_CGROUP_GETSOCKOPT = 21,
+	BPF_CGROUP_SETSOCKOPT = 22,
+	BPF_CGROUP_INET_SOCK_RELEASE = 34,
 	__MAX_BPF_ATTACH_TYPE
 };
 
@@ -267,6 +298,7 @@ enum bpf_attach_type {
 
 /* flags for BPF_PROG_QUERY */
 #define BPF_F_QUERY_EFFECTIVE	(1U << 0)
+#define BPF_F_MMAPABLE		(1U << 10)
 
 #define BPF_OBJ_NAME_LEN 16U
 
@@ -325,6 +357,23 @@ union bpf_attr {
 		};
 		__u64		flags;
 	};
+
+	struct { /* struct used by BPF_MAP_*_BATCH commands */
+		__aligned_u64	in_batch;	/* start batch,
+						 * NULL to start from beginning
+						 */
+		__aligned_u64	out_batch;	/* output: next start batch */
+		__aligned_u64	keys;
+		__aligned_u64	values;
+		__u32		count;		/* input/output:
+						 * input: # of key/value
+						 * elements
+						 * output: # of filled elements
+						 */
+		__u32		map_fd;
+		__u64		elem_flags;
+		__u64		flags;
+	} batch;
 
 	struct { /* anonymous struct used by BPF_PROG_LOAD command */
 		__u32		prog_type;	/* one of enum bpf_prog_type */
@@ -2294,7 +2343,16 @@ union bpf_attr {
 	FN(get_netns_cookie),		\
 	FN(get_current_ancestor_cgroup_id),	\
 	FN(sk_assign),			\
-	FN(ktime_get_boot_ns),
+	FN(ktime_get_boot_ns),		\
+	FN(seq_printf),		\
+	FN(seq_write),		\
+	FN(sk_cgroup_id),		\
+	FN(sk_ancestor_cgroup_id),		\
+	FN(ringbuf_output),		\
+	FN(ringbuf_reserve),		\
+	FN(ringbuf_submit),		\
+	FN(ringbuf_discard),		\
+	FN(ringbuf_query),
 
 /* integer value in 'imm' field of BPF_CALL instruction selects which helper
  * function eBPF program intends to call

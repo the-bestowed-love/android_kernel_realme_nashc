@@ -211,7 +211,6 @@ struct bpf_call_arg_meta {
 	int access_size;
 	int mem_size;
     u64 msize_max_value;
-    int ref_obj_id;
 	s64 msize_smax_value;
 	u64 msize_umax_value;
 	int ptr_id;
@@ -294,12 +293,13 @@ static bool reg_type_may_be_null(enum bpf_reg_type type)
 
 static bool type_is_refcounted(enum bpf_reg_type type)
 {
-	return type == PTR_TO_SOCKET;
+	return type == PTR_TO_SOCKET || type == PTR_TO_MEM;
 }
 
 static bool type_is_refcounted_or_null(enum bpf_reg_type type)
 {
-	return type == PTR_TO_SOCKET || type == PTR_TO_SOCKET_OR_NULL;
+	return type == PTR_TO_SOCKET || type == PTR_TO_SOCKET_OR_NULL ||
+	       type == PTR_TO_MEM || type == PTR_TO_MEM_OR_NULL;
 }
 
 static bool reg_is_refcounted(const struct bpf_reg_state *reg)
@@ -320,7 +320,8 @@ static bool reg_is_refcounted_or_null(const struct bpf_reg_state *reg)
 
 static bool arg_type_is_refcounted(enum bpf_arg_type type)
 {
-	return type == ARG_PTR_TO_SOCKET;
+	return type == ARG_PTR_TO_SOCKET || type == ARG_PTR_TO_ALLOC_MEM ||
+	       type == ARG_PTR_TO_ALLOC_MEM_OR_NULL;
 }
 
 /* Determine whether the function releases some resources allocated by another
@@ -1141,6 +1142,8 @@ static bool is_spillable_regtype(enum bpf_reg_type type)
 	case PTR_TO_PACKET_END:
 	case PTR_TO_FLOW_KEYS:
 	case CONST_PTR_TO_MAP:
+	case PTR_TO_MEM:
+	case PTR_TO_MEM_OR_NULL:
 	case PTR_TO_SOCKET:
 	case PTR_TO_SOCKET_OR_NULL:
 	case PTR_TO_SOCK_COMMON:
@@ -1401,6 +1404,29 @@ static int __check_mem_access(struct bpf_verifier_env *env, int regno,
 	}
 	return -EACCES;
 }
+
+static int check_map_access_type(struct bpf_verifier_env *env, u32 regno,
+				 int off, int size, enum bpf_access_type type)
+{
+	struct bpf_reg_state *regs = cur_regs(env);
+	struct bpf_map *map = regs[regno].map_ptr;
+	u32 cap = bpf_map_flags_to_cap(map);
+
+	if (type == BPF_WRITE && !(cap & BPF_MAP_CAN_WRITE)) {
+		verbose(env, "write into map forbidden, value_size=%d off=%d size=%d\n",
+			map->value_size, off, size);
+		return -EACCES;
+	}
+
+	if (type == BPF_READ && !(cap & BPF_MAP_CAN_READ)) {
+		verbose(env, "read from map forbidden, value_size=%d off=%d size=%d\n",
+			map->value_size, off, size);
+		return -EACCES;
+	}
+
+	return 0;
+}
+
 
 /* check read/write into a memory region with possible variable offset */
 static int check_mem_region_access(struct bpf_verifier_env *env, u32 regno,
@@ -1978,7 +2004,9 @@ static int check_mem_access(struct bpf_verifier_env *env, int insn_idx, u32 regn
 			verbose(env, "R%d leaks addr into map\n", value_regno);
 			return -EACCES;
 		}
-
+		err = check_map_access_type(env, regno, off, size, t);
+		if (err)
+			return err;
 		err = check_map_access(env, regno, off, size, false);
 		if (!err && t == BPF_READ && value_regno >= 0)
 			mark_reg_unknown(env, regs, value_regno);
@@ -2083,13 +2111,30 @@ static int check_mem_access(struct bpf_verifier_env *env, int insn_idx, u32 regn
 	return err;
 }
 
-static int check_xadd(struct bpf_verifier_env *env, int insn_idx, struct bpf_insn *insn)
+static int check_atomic(struct bpf_verifier_env *env, int insn_idx, struct bpf_insn *insn)
 {
+	int load_reg;
 	int err;
 
-	if ((BPF_SIZE(insn->code) != BPF_W && BPF_SIZE(insn->code) != BPF_DW) ||
-	    insn->imm != 0) {
-		verbose(env, "BPF_XADD uses reserved fields\n");
+	switch (insn->imm) {
+	case BPF_ADD:
+	case BPF_ADD | BPF_FETCH:
+	case BPF_AND:
+	case BPF_AND | BPF_FETCH:
+	case BPF_OR:
+	case BPF_OR | BPF_FETCH:
+	case BPF_XOR:
+	case BPF_XOR | BPF_FETCH:
+	case BPF_XCHG:
+	case BPF_CMPXCHG:
+		break;
+	default:
+		verbose(env, "BPF_ATOMIC uses invalid atomic opcode %02x\n", insn->imm);
+		return -EINVAL;
+	}
+
+	if (BPF_SIZE(insn->code) != BPF_W && BPF_SIZE(insn->code) != BPF_DW) {
+		verbose(env, "invalid atomic operand size\n");
 		return -EINVAL;
 	}
 
@@ -2103,29 +2148,71 @@ static int check_xadd(struct bpf_verifier_env *env, int insn_idx, struct bpf_ins
 	if (err)
 		return err;
 
+	if (insn->imm == BPF_CMPXCHG) {
+		/* Check comparison of R0 with memory location */
+		const u32 aux_reg = BPF_REG_0;
+
+		err = check_reg_arg(env, aux_reg, SRC_OP);
+		if (err)
+			return err;
+
+		if (is_pointer_value(env, aux_reg)) {
+			verbose(env, "R%d leaks addr into mem\n", aux_reg);
+			return -EACCES;
+		}
+	}
+
 	if (is_pointer_value(env, insn->src_reg)) {
 		verbose(env, "R%d leaks addr into mem\n", insn->src_reg);
 		return -EACCES;
 	}
 
 	if (is_ctx_reg(env, insn->dst_reg) ||
-	    is_pkt_reg(env, insn->dst_reg)  ||
+	    is_pkt_reg(env, insn->dst_reg) ||
+	    (cur_regs(env)[insn->dst_reg].type == PTR_TO_FLOW_KEYS) ||
 	    is_sk_reg(env, insn->dst_reg)) {
-		verbose(env, "BPF_XADD stores into R%d %s is not allowed\n",
-			insn->dst_reg, is_ctx_reg(env, insn->dst_reg) ?
-			"context" : "packet");
+		verbose(env, "BPF_ATOMIC stores into R%d %s is not allowed\n",
+			insn->dst_reg,
+			reg_type_str[cur_regs(env)[insn->dst_reg].type]);
 		return -EACCES;
 	}
 
-	/* check whether atomic_add can read the memory */
+	if (insn->imm & BPF_FETCH) {
+		if (insn->imm == BPF_CMPXCHG)
+			load_reg = BPF_REG_0;
+		else
+			load_reg = insn->src_reg;
+
+		/* check and record load of old value */
+		err = check_reg_arg(env, load_reg, DST_OP);
+		if (err)
+			return err;
+	} else {
+		/* This instruction accesses a memory location but doesn't
+		 * actually load it into a register.
+		 */
+		load_reg = -1;
+	}
+
+	/* Check whether we can read the memory, with second call for fetch
+	 * case to simulate the register fill.
+	 */
 	err = check_mem_access(env, insn_idx, insn->dst_reg, insn->off,
 			       BPF_SIZE(insn->code), BPF_READ, -1, true);
+	if (!err && load_reg >= 0)
+		err = check_mem_access(env, insn_idx, insn->dst_reg, insn->off,
+				       BPF_SIZE(insn->code), BPF_READ, load_reg,
+				       true);
 	if (err)
 		return err;
 
-	/* check whether atomic_add can write into the same memory */
-	return check_mem_access(env, insn_idx, insn->dst_reg, insn->off,
-				BPF_SIZE(insn->code), BPF_WRITE, -1, true);
+	/* Check whether we can write into the same memory. */
+	err = check_mem_access(env, insn_idx, insn->dst_reg, insn->off,
+			       BPF_SIZE(insn->code), BPF_WRITE, -1, true);
+	if (err)
+		return err;
+
+	return 0;
 }
 
 static int __check_stack_boundary(struct bpf_verifier_env *env, u32 regno,
@@ -2295,6 +2382,9 @@ static int check_helper_mem_access(struct bpf_verifier_env *env, int regno,
 	case PTR_TO_FLOW_KEYS:
 		return check_flow_keys_access(env, reg->off, access_size);
 	case PTR_TO_MAP_VALUE:
+		if (check_map_access_type(env, regno, reg->off, access_size,
+					  meta && meta->raw_mode ? BPF_WRITE : BPF_READ))
+			return -EACCES;
 		return check_map_access(env, regno, reg->off, access_size,
 					zero_size_allowed);
 	case PTR_TO_MEM:
@@ -2505,10 +2595,6 @@ static int check_func_arg(struct bpf_verifier_env *env, u32 regno,
 			return -EFAULT;
 		}
 		meta->ptr_id = reg->id;
-	} else if (arg_type == ARG_PTR_TO_SOCKET) {
-		expected_type = PTR_TO_SOCKET;
-		if (type != expected_type)
-			goto err_type;
 	} else if (arg_type == ARG_PTR_TO_SPIN_LOCK) {
 		if (meta->func_id == BPF_FUNC_spin_lock) {
 			if (process_spin_lock(env, regno, true))
@@ -2543,13 +2629,17 @@ static int check_func_arg(struct bpf_verifier_env *env, u32 regno,
 			/* final test in check_stack_boundary() */;
 		else if (type != expected_type)
 			goto err_type;
-		if (meta->ref_obj_id) {
-			verbose(env, "verifier internal error: more than one arg with ref_obj_id R%d %u %u\n",
-				regno, reg->ref_obj_id,
-				meta->ref_obj_id);
-			return -EFAULT;
+		/* Release helpers require the original allocation, not an
+		 * interior pointer. Ownership uses id in this verifier.
+		 */
+		if (reg->off || !tnum_equals_const(reg->var_off, 0)) {
+			verbose(env, "R%d must point to the start of allocated memory\n",
+				regno);
+			return -EACCES;
 		}
-		meta->ref_obj_id = reg->ref_obj_id;
+		if (meta->ptr_id || !reg->id)
+			return -EFAULT;
+		meta->ptr_id = reg->id;
 	} else if (arg_type_is_int_ptr(arg_type)) {
 		expected_type = PTR_TO_STACK;
 		if (!type_is_pkt_pointer(type) &&
@@ -3082,6 +3172,7 @@ record_func_map(struct bpf_verifier_env *env, struct bpf_call_arg_meta *meta,
 		int func_id, int insn_idx)
 {
 	struct bpf_insn_aux_data *aux = &env->insn_aux_data[insn_idx];
+	struct bpf_map *map = meta->map_ptr;
 
 	if (func_id != BPF_FUNC_tail_call &&
 	    func_id != BPF_FUNC_map_lookup_elem &&
@@ -3092,6 +3183,13 @@ record_func_map(struct bpf_verifier_env *env, struct bpf_call_arg_meta *meta,
 	if (meta->map_ptr == NULL) {
 		verbose(env, "kernel subsystem misconfigured verifier\n");
 		return -EINVAL;
+	}
+
+	if ((map->map_flags & BPF_F_RDONLY_PROG) &&
+	    (func_id == BPF_FUNC_map_delete_elem ||
+	     func_id == BPF_FUNC_map_update_elem)) {
+		verbose(env, "write into map forbidden\n");
+		return -EACCES;
 	}
 
 	if (!BPF_MAP_PTR(aux->map_state))
@@ -3289,9 +3387,13 @@ static int check_helper_call(struct bpf_verifier_env *env, int func_id, int insn
 		regs[BPF_REG_0].type = PTR_TO_TCP_SOCK_OR_NULL;
 		regs[BPF_REG_0].id = ++env->id_gen;
 	} else if (fn->ret_type == RET_PTR_TO_ALLOC_MEM_OR_NULL) {
+		int id = acquire_reference_state(env, insn_idx);
+
+		if (id < 0)
+			return id;
 		mark_reg_known_zero(env, regs, BPF_REG_0);
 		regs[BPF_REG_0].type = PTR_TO_MEM_OR_NULL;
-		regs[BPF_REG_0].id = ++env->id_gen;
+		regs[BPF_REG_0].id = id;
 		regs[BPF_REG_0].mem_size = meta.mem_size;
 	} else {
 		verbose(env, "unknown return type %d of func %s#%d\n",
@@ -3718,6 +3820,7 @@ static int adjust_ptr_min_max_vals(struct bpf_verifier_env *env,
 	}
 
 	switch (ptr_reg->type) {
+	case PTR_TO_MEM_OR_NULL:
 	case PTR_TO_MAP_VALUE_OR_NULL:
 		verbose(env, "R%d pointer arithmetic on %s prohibited, null-check it first\n",
 			dst, reg_type_str[ptr_reg->type]);
@@ -6358,12 +6461,17 @@ static int do_check(struct bpf_verifier_env *env)
 		} else if (class == BPF_STX) {
 			enum bpf_reg_type *prev_dst_type, dst_reg_type;
 
-			if (BPF_MODE(insn->code) == BPF_XADD) {
-				err = check_xadd(env, env->insn_idx, insn);
+			if (BPF_MODE(insn->code) == BPF_ATOMIC) {
+				err = check_atomic(env, env->insn_idx, insn);
 				if (err)
 					return err;
 				env->insn_idx++;
 				continue;
+			}
+
+			if (BPF_MODE(insn->code) != BPF_MEM || insn->imm != 0) {
+				verbose(env, "BPF_STX uses reserved fields\n");
+				return -EINVAL;
 			}
 
 			/* check src1 operand */
@@ -6645,7 +6753,7 @@ static int replace_map_fd_with_map_ptr(struct bpf_verifier_env *env)
 
 		if (BPF_CLASS(insn->code) == BPF_STX &&
 		    ((BPF_MODE(insn->code) != BPF_MEM &&
-		      BPF_MODE(insn->code) != BPF_XADD) || insn->imm != 0)) {
+		      BPF_MODE(insn->code) != BPF_ATOMIC) || insn->imm != 0)) {
 			verbose(env, "BPF_STX uses reserved fields\n");
 			return -EINVAL;
 		}

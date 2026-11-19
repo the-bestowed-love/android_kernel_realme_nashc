@@ -3396,7 +3396,7 @@ struct sock *sk_lookup(struct net *net, struct bpf_sock_tuple *tuple,
 		if (proto == IPPROTO_TCP)
 			sk = __inet6_lookup(net, &tcp_hashinfo, NULL, 0,
 					    src6, tuple->ipv6.sport,
-					    dst6, tuple->ipv6.dport,
+					    dst6, ntohs(tuple->ipv6.dport),
 					    dif, sdif, &refcounted);
 		else
 			sk = __udp6_lib_lookup(net, src6, tuple->ipv6.sport,
@@ -3425,9 +3425,13 @@ __bpf_sk_lookup(struct sk_buff *skb, struct bpf_sock_tuple *tuple, u32 len,
 	struct net *net;
 	int sdif;
 
-	family = len == sizeof(tuple->ipv4) ? AF_INET : AF_INET6;
+	if (len == sizeof(tuple->ipv4))
+		family = AF_INET;
+	else if (len == sizeof(tuple->ipv6))
+		family = AF_INET6;
 
-	if (unlikely(family == AF_UNSPEC || netns_id > U32_MAX || flags))
+	if (unlikely(family == AF_UNSPEC || flags ||
+		     ((s32)netns_id >= 0 && netns_id > S32_MAX)))
 		goto out;
 
 	if (family == AF_INET)
@@ -3435,7 +3439,7 @@ __bpf_sk_lookup(struct sk_buff *skb, struct bpf_sock_tuple *tuple, u32 len,
 	else
 		sdif = inet6_sdif(skb);
 
-	if (netns_id) {
+	if ((s32)netns_id >= 0) {
 		net = get_net_ns_by_id(caller_net, netns_id);
 		if (unlikely(!net))
 			goto out;
@@ -3445,8 +3449,10 @@ __bpf_sk_lookup(struct sk_buff *skb, struct bpf_sock_tuple *tuple, u32 len,
 		net = caller_net;
 		sk = sk_lookup(net, tuple, ifindex, sdif, family, proto);
 	}
-	if (sk)
-		sk = sk_to_full_sk(sk);
+	if (sk && !sk_fullsock(sk)) {
+		sock_gen_put(sk);
+		sk = NULL;
+	}
 out:
 	return (unsigned long) sk;
 }
@@ -3461,9 +3467,11 @@ bpf_sk_lookup(struct sk_buff *skb, struct bpf_sock_tuple *tuple, u32 len,
 	if (skb->dev) {
 		caller_net = dev_net(skb->dev);
 		ifindex = skb->dev->ifindex;
-	} else {
+	} else if (skb->sk) {
 		caller_net = sock_net(skb->sk);
 		ifindex = 0;
+	} else {
+		return 0;
 	}
 
 	return __bpf_sk_lookup(skb, tuple, len, caller_net, ifindex,
@@ -4111,6 +4119,18 @@ BPF_CALL_1(bpf_get_socket_cookie_sock_addr, struct bpf_sock_addr_kern *, ctx)
 
 static const struct bpf_func_proto bpf_get_socket_cookie_sock_addr_proto = {
 	.func		= bpf_get_socket_cookie_sock_addr,
+	.gpl_only	= false,
+	.ret_type	= RET_INTEGER,
+	.arg1_type	= ARG_PTR_TO_CTX,
+};
+
+BPF_CALL_1(bpf_get_socket_cookie_sock, struct sock *, ctx)
+{
+	return sock_gen_cookie(ctx);
+}
+
+static const struct bpf_func_proto bpf_get_socket_cookie_sock_proto = {
+	.func		= bpf_get_socket_cookie_sock,
 	.gpl_only	= false,
 	.ret_type	= RET_INTEGER,
 	.arg1_type	= ARG_PTR_TO_CTX,
@@ -5135,6 +5155,8 @@ bpf_base_func_proto(enum bpf_func_id func_id)
 	}
 }
 
+const struct bpf_func_proto bpf_sk_storage_get_cg_sock_proto __weak;
+
 static const struct bpf_func_proto *
 sock_filter_func_proto(enum bpf_func_id func_id, const struct bpf_prog *prog)
 {
@@ -5144,8 +5166,12 @@ sock_filter_func_proto(enum bpf_func_id func_id, const struct bpf_prog *prog)
 	 */
 	case BPF_FUNC_get_current_uid_gid:
 		return &bpf_get_current_uid_gid_proto;
+	case BPF_FUNC_get_socket_cookie:
+		return &bpf_get_socket_cookie_sock_proto;
 	case BPF_FUNC_get_local_storage:
 		return &bpf_get_local_storage_proto;
+	case BPF_FUNC_sk_storage_get:
+		return &bpf_sk_storage_get_cg_sock_proto;
 	default:
 		return bpf_base_func_proto(func_id);
 	}
@@ -5218,6 +5244,12 @@ cg_skb_func_proto(enum bpf_func_id func_id, const struct bpf_prog *prog)
 	case BPF_FUNC_sk_storage_delete:
 		return &bpf_sk_storage_delete_proto;
 #ifdef CONFIG_INET
+	case BPF_FUNC_sk_lookup_tcp:
+		return &bpf_sk_lookup_tcp_proto;
+	case BPF_FUNC_sk_lookup_udp:
+		return &bpf_sk_lookup_udp_proto;
+	case BPF_FUNC_sk_release:
+		return &bpf_sk_release_proto;
 	case BPF_FUNC_tcp_sock:
 		return &bpf_tcp_sock_proto;
 #endif
@@ -5671,6 +5703,7 @@ static bool __sock_filter_check_attach_type(int off,
 	case offsetof(struct bpf_sock, priority):
 		switch (attach_type) {
 		case BPF_CGROUP_INET_SOCK_CREATE:
+		case BPF_CGROUP_INET_SOCK_RELEASE:
 			goto full_access;
 		default:
 			return false;

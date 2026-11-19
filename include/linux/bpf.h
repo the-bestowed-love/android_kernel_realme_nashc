@@ -15,6 +15,8 @@
 #include <linux/err.h>
 #include <linux/rbtree_latch.h>
 #include <linux/numa.h>
+#include <linux/mm_types.h>
+#include <linux/mutex.h>
 #include <linux/wait.h>
 #include <linux/poll.h>
 
@@ -37,6 +39,15 @@ struct bpf_map_ops {
 	int (*map_get_next_key)(struct bpf_map *map, void *key, void *next_key);
 	void (*map_release_uref)(struct bpf_map *map);
 	void *(*map_lookup_elem_sys_only)(struct bpf_map *map, void *key);
+	int (*map_lookup_batch)(struct bpf_map *map, const union bpf_attr *attr,
+				union bpf_attr __user *uattr);
+
+	int (*map_update_batch)(struct bpf_map *map, const union bpf_attr *attr,
+				union bpf_attr __user *uattr);
+	int (*map_delete_batch)(struct bpf_map *map, const union bpf_attr *attr,
+				union bpf_attr __user *uattr);
+	int (*map_lookup_and_delete_batch)(struct bpf_map *map, const union bpf_attr *attr,
+				union bpf_attr __user *uattr);
 
 	/* funcs callable from userspace and from eBPF programs */
 	void *(*map_lookup_elem)(struct bpf_map *map, void *key);
@@ -98,15 +109,18 @@ struct bpf_map {
     struct bpf_map_memory memory;
 	u32 pages;
 	bool unpriv_array;
+	bool frozen; /* write-once */
 	/* 51 bytes hole */
 
 	/* The 3rd and 4th cacheline with misc members to avoid false sharing
 	 * particularly with refcounting.
 	 */
 	struct user_struct *user ____cacheline_aligned;
-	atomic_t refcnt;
-	atomic_t usercnt;
+	atomic64_t refcnt;
+	atomic64_t usercnt;
 	struct work_struct work;
+	struct mutex freeze_mutex;
+	atomic64_t writecnt;
 	char name[BPF_OBJ_NAME_LEN];
 };
 
@@ -432,6 +446,36 @@ struct bpf_array {
 
 #define MAX_TAIL_CALL_CNT 32
 
+#define BPF_F_ACCESS_MASK	(BPF_F_RDONLY |		\
+				 BPF_F_RDONLY_PROG |	\
+				 BPF_F_WRONLY |		\
+				 BPF_F_WRONLY_PROG)
+
+#define BPF_MAP_CAN_READ	BIT(0)
+#define BPF_MAP_CAN_WRITE	BIT(1)
+
+static inline u32 bpf_map_flags_to_cap(struct bpf_map *map)
+{
+	u32 access_flags = map->map_flags & (BPF_F_RDONLY_PROG | BPF_F_WRONLY_PROG);
+
+	/* Combination of BPF_F_RDONLY_PROG | BPF_F_WRONLY_PROG is
+	 * not possible.
+	 */
+	if (access_flags & BPF_F_RDONLY_PROG)
+		return BPF_MAP_CAN_READ;
+	else if (access_flags & BPF_F_WRONLY_PROG)
+		return BPF_MAP_CAN_WRITE;
+	else
+		return BPF_MAP_CAN_READ | BPF_MAP_CAN_WRITE;
+}
+
+static inline bool bpf_map_flags_access_ok(u32 access_flags)
+{
+	return (access_flags & (BPF_F_RDONLY_PROG | BPF_F_WRONLY_PROG)) !=
+	       (BPF_F_RDONLY_PROG | BPF_F_WRONLY_PROG);
+}
+
+
 struct bpf_event_entry {
 	struct perf_event *event;
 	struct file *perf_file;
@@ -565,6 +609,7 @@ void bpf_map_free_id(struct bpf_map *map, bool do_idr_lock);
 struct bpf_map *bpf_map_get_with_uref(u32 ufd);
 struct bpf_map *__bpf_map_get(struct fd f);
 struct bpf_map * __must_check bpf_map_inc(struct bpf_map *map, bool uref);
+void bpf_map_inc_with_uref(struct bpf_map *map);
 void bpf_map_put_with_uref(struct bpf_map *map);
 void bpf_map_put(struct bpf_map *map);
 int bpf_map_precharge_memlock(u32 pages);
@@ -573,8 +618,17 @@ void bpf_map_uncharge_memlock(struct bpf_map *map, u32 pages);
 int bpf_map_charge_init(struct bpf_map_memory *mem, u64 size);
 void bpf_map_charge_finish(struct bpf_map_memory *mem);
 void *bpf_map_area_alloc(size_t size, int numa_node);
+void *bpf_map_area_mmapable_alloc(size_t size, int numa_node);
 void bpf_map_area_free(void *base);
+bool bpf_map_write_active(const struct bpf_map *map);
 void bpf_map_init_from_attr(struct bpf_map *map, union bpf_attr *attr);
+
+int generic_map_lookup_batch(struct bpf_map *map, const union bpf_attr *attr,
+			     union bpf_attr __user *uattr);
+int generic_map_update_batch(struct bpf_map *map, const union bpf_attr *attr,
+			     union bpf_attr __user *uattr);
+int generic_map_delete_batch(struct bpf_map *map, const union bpf_attr *attr,
+			     union bpf_attr __user *uattr);
 
 extern int sysctl_unprivileged_bpf_disabled;
 
